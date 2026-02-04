@@ -66,16 +66,19 @@ def create_driver(webdriver_port: int, timeout: int = 3) -> webdriver.Remote | N
 
 def start_servo(webdriver_port: int, servo_path: str) -> webdriver.Remote | None:
     """Start servo and create webdriver"""
-    try:
-        subprocess.Popen(
-            [
-                servo_path,
-                f"--webdriver={webdriver_port}",
-            ]
-        )
-    except FileNotFoundError:
-        print("The servo binary does not exist")
-        return sys.exit(1)
+    if servo_path is not None:
+        try:
+            subprocess.Popen(
+                [
+                    servo_path,
+                    f"--webdriver={webdriver_port}",
+                ]
+            )
+        except FileNotFoundError:
+            print("The servo binary does not exist")
+            return sys.exit(1)
+    else:
+        print(f"\n#### Warning ####\n> The test tool is being run without `servo_path`,\n  make sure `servo --webdriver={webdriver_port}` is already running\n####\n")
     return create_driver(webdriver_port)
 
 
@@ -137,7 +140,7 @@ def oswalk_error(error: OSError):
 
 def main():
     parser = argparse.ArgumentParser(description="Run Blink Perf Tests on Servo Instance.")
-    parser.add_argument("servo_path", type=str, help="the servo binary")
+    parser.add_argument("-s", "--servo_path", default=None, type=str, help="the servo binary")
     parser.add_argument(
         "-w", "--webdriver", default=7000, type=int, action="store", help="The webdriver port servo will listen on."
     )
