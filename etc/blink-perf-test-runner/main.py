@@ -100,7 +100,7 @@ def test(s: str, driver: webdriver.Remote) -> tuple[str, str, str] | AbortReason
             # get the avg line or return None if it doesn't exist yet
             avg_line = next(filter(lambda x: "avg" in x, result_lines), None)
             min_line = next(filter(lambda x: "min" in x, result_lines), None)
-            max_line = next(filter(lambda x: "max" in x, result_lines), None)
+            max_line = next(filter(lambda x: "max " in x, result_lines), None)
             if avg_line is not None and min_line is not None and max_line is not None:
                 return (avg_line.split()[1], min_line.split()[1], max_line.split()[1])
             time.sleep(1)
