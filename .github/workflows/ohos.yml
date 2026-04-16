@@ -46,7 +46,7 @@ jobs:
   build-openharmony:
     name: OpenHarmony Build
     timeout-minutes: 60
-    runs-on: ubuntu-24.04
+    runs-on: hos-builder
     strategy:
       matrix:
         target: ["aarch64-unknown-linux-ohos", "x86_64-unknown-linux-ohos"]
@@ -442,7 +442,7 @@ jobs:
   # to the try-label parser, so it can include the information in the try-label comment.
   collect-job-results:
     name: Collect Job Results
-    runs-on: ubuntu-latest
+    runs-on: hos-builder
     needs: [build-harmonyos-aarch64, bench-harmonyos-aarch64, scenario-test-harmonyos]
     outputs:
       collected_job_status: ${{ steps.result.outputs.JOB_RESULTS_JSON }}
