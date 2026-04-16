@@ -1,0 +1,17 @@
+name: hehe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-self-hosted:
+    runs-on: [self-hosted, Linux, hos-runner]
+
+    steps:
+      - name: Show where this ran
+        run: |
+          echo "runner.name=${{ runner.name }}"
+          echo "runner.os=${{ runner.os }}"
+          echo "runner.arch=${{ runner.arch }}"
+          echo "runner.environment=${{ runner.environment }}"
+          hostname
