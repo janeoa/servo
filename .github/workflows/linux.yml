@@ -96,7 +96,7 @@ jobs:
   # Runs the underlying job (“workload”) on a self-hosted runner if available,
   # with the help of a `runner-select` job and a `runner-timeout` job.
   runner-select:
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, hos-builder]
     outputs:
       unique-id: ${{ steps.select.outputs.unique-id }}
       selected-runner-label: ${{ steps.select.outputs.selected-runner-label }}
@@ -116,7 +116,7 @@ jobs:
     needs:
       - runner-select
     name: Linux Build [${{ needs.runner-select.outputs.unique-id }}]
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, hos-builder]
     outputs:
       artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
     steps:
@@ -239,7 +239,7 @@ jobs:
   build-libservo:
     if: ${{ inputs.build-libservo }}
     name: Build libservo and MSRV check
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, hos-builder]
     steps:
       - uses: actions/checkout@v5
         if: github.event_name != 'pull_request_target'
@@ -285,7 +285,7 @@ jobs:
   # Runs the underlying job (“workload”) on a self-hosted runner if available.
   runner-select-coverage:
     if: inputs.coverage
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, hos-builder]
     outputs:
       unique-id: ${{ steps.select.outputs.unique-id }}
       selected-runner-label: ${{ steps.select.outputs.selected-runner-label }}
@@ -303,7 +303,7 @@ jobs:
     if: inputs.coverage
     needs: runner-select-coverage
     name: Unit Test Coverage [${{ needs.runner-select-coverage.outputs.unique-id }}]
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, hos-builder]
     continue-on-error: true
     steps:
       - uses: servo/ci-runners/actions/checkout@f0b81b95522256c64ee207b4236ec71fc23b99a1
@@ -367,7 +367,7 @@ jobs:
   media-examples:
     name: Media Examples
     if: ${{ inputs.unit-tests }}
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, hos-builder]
     steps:
       - uses: actions/checkout@v5
         if: github.event_name != 'pull_request_target'
