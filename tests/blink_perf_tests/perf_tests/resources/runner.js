@@ -100,19 +100,7 @@ if (window.testRunner) {
     }
 
     PerfTestRunner.gc = function () {
-        if (window.GCController)
-            window.GCController.collectAll();
-        else {
-            function gcRec(n) {
-                if (n < 1)
-                    return {};
-                var temp = {i: "ab" + i + (i / 100000)};
-                temp += "foo";
-                gcRec(n-1);
-            }
-            for (var i = 0; i < 1000; i++)
-                gcRec(10);
-        }
+        navigator.servo.garbageCollectAllContexts()
     };
 
     function logInDocument(text) {

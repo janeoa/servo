@@ -73,6 +73,7 @@ def start_servo(webdriver_port: int, servo_path: str) -> webdriver.Remote | None
             [
                 servo_path,
                 f"--webdriver={webdriver_port}",
+                "--pref=dom_servo_gc_enabled=true"
             ]
         )
     except FileNotFoundError:
