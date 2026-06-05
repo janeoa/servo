@@ -47,7 +47,7 @@ jobs:
   build-openharmony:
     name: OpenHarmony Build
     timeout-minutes: 60
-    runs-on: hos-builder
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         target: ["aarch64-unknown-linux-ohos", "x86_64-unknown-linux-ohos"]
