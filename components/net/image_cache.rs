@@ -10,7 +10,7 @@ use std::mem;
 use std::sync::Arc;
 
 use imsz::imsz_from_reader;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
@@ -31,6 +31,7 @@ use resvg::usvg::{self, fontdb};
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::id::{PipelineId, WebViewId};
 use servo_base::threadpool::ThreadPool;
+use servo_config::pref;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use webrender_api::ImageKey as WebRenderImageKey;
 use webrender_api::units::DeviceIntSize;
@@ -232,11 +233,23 @@ enum CacheResult<'a> {
 struct CompletedLoad {
     image_response: ImageResponse,
     id: PendingImageId,
+    last_used: u64,
 }
 
 impl CompletedLoad {
-    fn new(image_response: ImageResponse, id: PendingImageId) -> CompletedLoad {
-        CompletedLoad { image_response, id }
+    fn new(image_response: ImageResponse, id: PendingImageId, last_used: u64) -> CompletedLoad {
+        CompletedLoad {
+            image_response,
+            id,
+            last_used,
+        }
+    }
+
+    fn decoded_raster_bytes(&self) -> Option<usize> {
+        match &self.image_response {
+            ImageResponse::Loaded(Image::Raster(image), _) => Some(image.bytes.len()),
+            _ => None,
+        }
     }
 }
 
@@ -477,6 +490,9 @@ struct ImageCacheStore {
     /// Images that have finished loading (successful or not)
     completed_loads: HashMap<ImageKey, CompletedLoad>,
 
+    /// Monotonic counter used to age completed image cache entries for eviction.
+    lru_counter: u64,
+
     /// Vector (e.g. SVG) images that have been sucessfully loaded and parsed
     /// but are yet to be rasterized. Since the same SVG data can be used for
     /// rasterizing at different sizes, we use this hasmap to share the data.
@@ -509,6 +525,129 @@ struct ImageCacheStore {
 }
 
 impl ImageCacheStore {
+    fn next_lru_counter(&mut self) -> u64 {
+        self.lru_counter = self.lru_counter.saturating_add(1);
+        self.lru_counter
+    }
+
+    fn completed_raster_decoded_bytes(&self) -> usize {
+        self.completed_loads
+            .values()
+            .filter_map(CompletedLoad::decoded_raster_bytes)
+            .sum()
+    }
+
+    fn evict_completed_images_if_needed(&mut self, protected_key: Option<&ImageKey>) {
+        let threshold_bytes = pref!(network_image_cache_eviction_threshold_bytes);
+        if threshold_bytes == 0 {
+            return;
+        }
+
+        let mut decoded_bytes = self.completed_raster_decoded_bytes() as u64;
+        if decoded_bytes <= threshold_bytes {
+            return;
+        }
+
+        let mut candidates = self
+            .completed_loads
+            .iter()
+            .filter_map(|(key, load)| {
+                if protected_key.is_some_and(|protected_key| protected_key == key) {
+                    return None;
+                }
+                let bytes = load.decoded_raster_bytes()?;
+                let image_key = match &load.image_response {
+                    ImageResponse::Loaded(Image::Raster(image), _) => image.id,
+                    _ => None,
+                }?;
+                Some((key.clone(), load.last_used, bytes, image_key))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, last_used, _, _)| *last_used);
+
+        let mut evicted_entries = 0;
+        let mut evicted_bytes = 0;
+        let mut image_updates = Vec::new();
+        for (key, _, bytes, image_key) in candidates {
+            if decoded_bytes <= threshold_bytes {
+                break;
+            }
+
+            if self.completed_loads.remove(&key).is_some() {
+                decoded_bytes = decoded_bytes.saturating_sub(bytes as u64);
+                evicted_entries += 1;
+                evicted_bytes += bytes;
+                image_updates.push(ImageUpdate::DeleteImage(image_key));
+            }
+        }
+
+        if evicted_entries == 0 {
+            return;
+        }
+
+        self.paint_api
+            .update_images(self.webview_id.into(), image_updates.into());
+
+        info!(
+            "image-cache hard-evicted completed raster images: entries={}, deleted_webrender_images={}, decoded_mib={:.2}, decoded_bytes={}, remaining_decoded_mib={:.2}, remaining_decoded_bytes={}, threshold_mib={:.2}, threshold_bytes={}",
+            evicted_entries,
+            evicted_entries,
+            evicted_bytes as f64 / 1024.0 / 1024.0,
+            evicted_bytes,
+            decoded_bytes as f64 / 1024.0 / 1024.0,
+            decoded_bytes,
+            threshold_bytes as f64 / 1024.0 / 1024.0,
+            threshold_bytes,
+        );
+        self.log_cache_stats_if_enabled("hard_evict_completed_images");
+    }
+
+    fn log_cache_stats_if_enabled(&self, reason: &str) {
+        if !pref!(dom_servo_testing_image_cache_eviction_enabled) {
+            return;
+        }
+
+        let mut completed_raster_images = 0;
+        let mut completed_vector_images = 0;
+        let mut failed_entries = 0;
+        let mut decoded_bytes = 0;
+
+        for completed_load in self.completed_loads.values() {
+            match &completed_load.image_response {
+                ImageResponse::Loaded(Image::Raster(image), _) => {
+                    completed_raster_images += 1;
+                    decoded_bytes += image.bytes.len();
+                },
+                ImageResponse::Loaded(Image::Vector(..), _) => {
+                    completed_vector_images += 1;
+                },
+                ImageResponse::FailedToLoadOrDecode | ImageResponse::MetadataLoaded(_) => {
+                    failed_entries += 1;
+                },
+            }
+        }
+
+        let mut rasterized_vector_images = 0;
+        for task in self.rasterized_vector_images.values() {
+            if let Some(image) = &task.result {
+                rasterized_vector_images += 1;
+                decoded_bytes += image.bytes.len();
+            }
+        }
+
+        info!(
+            "image-cache stats after {reason}: completed_entries={}, loaded_images={}, raster_images={}, vector_images={}, rasterized_vector_images={}, failed_entries={}, decoded_mib={:.2}, decoded_bytes={}",
+            self.completed_loads.len(),
+            completed_raster_images + completed_vector_images,
+            completed_raster_images,
+            completed_vector_images,
+            rasterized_vector_images,
+            failed_entries,
+            decoded_bytes as f64 / 1024.0 / 1024.0,
+            decoded_bytes,
+        );
+    }
+
     #[cfg(feature = "test-util")]
     fn number_of_rasterize_tasks(&self) -> usize {
         self.svg_rasterization_task_store.0.len()
@@ -546,8 +685,9 @@ impl ImageCacheStore {
     /// If a key is available the image will be immediately loaded, otherwise it will load then the next batch of
     /// keys is received. Only call this if the image does not have a `LoadKey` yet.
     fn load_image_with_keycache(&mut self, pending_image: PendingKey) {
-        if let PendingKey::Svg((pending_id, ref _raster_image, requested_size)) = pending_image &&
-            self.key_cache
+        if let PendingKey::Svg((pending_id, ref _raster_image, requested_size)) = pending_image
+            && self
+                .key_cache
                 .evicted_images
                 .remove(&(pending_id, requested_size))
         {
@@ -676,15 +816,17 @@ impl ImageCacheStore {
             LoadResult::FailedToLoadOrDecode => ImageResponse::FailedToLoadOrDecode,
         };
 
-        let completed_load = CompletedLoad::new(image_response.clone(), key);
-        self.completed_loads.insert(
-            (
-                pending_load.url,
-                pending_load.load_origin,
-                pending_load.cors_setting,
-            ),
-            completed_load,
+        let completed_key = (
+            pending_load.url,
+            pending_load.load_origin,
+            pending_load.cors_setting,
         );
+        let completed_load =
+            CompletedLoad::new(image_response.clone(), key, self.next_lru_counter());
+        self.completed_loads
+            .insert(completed_key.clone(), completed_load);
+        self.evict_completed_images_if_needed(Some(&completed_key));
+        self.log_cache_stats_if_enabled("complete_load");
 
         for listener in pending_load.listeners {
             listener.respond(image_response.clone());
@@ -699,15 +841,16 @@ impl ImageCacheStore {
     ) {
         if let Some(loaded_image) =
             self.completed_loads
-                .remove(&(url.clone(), origin.clone(), *cors_setting)) &&
-            let ImageResponse::Loaded(Image::Raster(image), _) = loaded_image.image_response &&
-            let Some(id) = image.id
+                .remove(&(url.clone(), origin.clone(), *cors_setting))
+            && let ImageResponse::Loaded(Image::Raster(image), _) = loaded_image.image_response
+            && let Some(id) = image.id
         {
             self.paint_api.update_images(
                 self.webview_id.into(),
                 vec![ImageUpdate::DeleteImage(id)].into(),
             );
         }
+        self.log_cache_stats_if_enabled("evict_completed_image");
     }
 
     fn remove_rasterized_vector_image(
@@ -740,22 +883,29 @@ impl ImageCacheStore {
             // KeyCache that it was evicted.
             self.evict_image_from_keycache(image_id, device_size);
         }
+        self.log_cache_stats_if_enabled("evict_rasterized_image");
     }
 
     /// Return a completed image if it exists, or None if there is no complete load
     /// or the complete load is not fully decoded or is unavailable.
     fn get_completed_image_if_available(
-        &self,
+        &mut self,
         url: ServoUrl,
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> Option<Result<(Image, ServoUrl), ()>> {
-        self.completed_loads
-            .get(&(url, origin, cors_setting))
-            .map(|completed_load| match &completed_load.image_response {
-                ImageResponse::Loaded(image, url) => Ok((image.clone(), url.clone())),
-                ImageResponse::FailedToLoadOrDecode | ImageResponse::MetadataLoaded(_) => Err(()),
-            })
+        let cache_key = (url, origin, cors_setting);
+        if !self.completed_loads.contains_key(&cache_key) {
+            return None;
+        }
+
+        let last_used = self.next_lru_counter();
+        let completed_load = self.completed_loads.get_mut(&cache_key).unwrap();
+        completed_load.last_used = last_used;
+        Some(match &completed_load.image_response {
+            ImageResponse::Loaded(image, url) => Ok((image.clone(), url.clone())),
+            ImageResponse::FailedToLoadOrDecode | ImageResponse::MetadataLoaded(_) => Err(()),
+        })
     }
 
     /// Handle a message from one of the decoder worker threads or from a sync
@@ -810,6 +960,7 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
             store: Arc::new(Mutex::new(ImageCacheStore {
                 pending_loads: AllPendingLoads::new(),
                 completed_loads: HashMap::new(),
+                lru_counter: 0,
                 vector_images: FxHashMap::default(),
                 rasterized_vector_images: FxHashMap::default(),
                 broken_image_icon_image: OnceCell::new(),
@@ -886,7 +1037,7 @@ impl ImageCache for ImageCacheImpl {
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> Option<Image> {
-        let store = self.store.lock();
+        let mut store = self.store.lock();
         let result = store.get_completed_image_if_available(url, origin, cors_setting);
         match result {
             Some(Ok((img, _))) => Some(img),
@@ -1006,10 +1157,10 @@ impl ImageCache for ImageCacheImpl {
             return Some(result.clone());
         }
 
-        if let Some(svg_id) = svg_id &&
-            let Some(old_mapped_image_id) =
-                self.svg_id_image_id_map.lock().insert(svg_id, image_id) &&
-            old_mapped_image_id != image_id
+        if let Some(svg_id) = svg_id
+            && let Some(old_mapped_image_id) =
+                self.svg_id_image_id_map.lock().insert(svg_id, image_id)
+            && old_mapped_image_id != image_id
         {
             store.vector_images.remove(&old_mapped_image_id);
             store
@@ -1123,8 +1274,8 @@ impl ImageCache for ImageCacheImpl {
     /// Inform the image cache about a response for a pending request.
     fn notify_pending_response(&self, id: PendingImageId, action: FetchResponseMsg) {
         match (action, id) {
-            (FetchResponseMsg::ProcessRequestBody(..), _) |
-            (FetchResponseMsg::ProcessCspViolations(..), _) => (),
+            (FetchResponseMsg::ProcessRequestBody(..), _)
+            | (FetchResponseMsg::ProcessCspViolations(..), _) => (),
             (FetchResponseMsg::ProcessResponse(_, response), _) => {
                 debug!("Received {:?} for {:?}", response.as_ref().map(|_| ()), id);
                 let mut store = self.store.lock();
@@ -1137,8 +1288,8 @@ impl ImageCache for ImageCacheImpl {
                                     FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => {
                                         CorsStatus::Safe
                                     },
-                                    FilteredMetadata::Opaque |
-                                    FilteredMetadata::OpaqueRedirect(_) => CorsStatus::Unsafe,
+                                    FilteredMetadata::Opaque
+                                    | FilteredMetadata::OpaqueRedirect(_) => CorsStatus::Unsafe,
                                 },
                                 Some(unsafe_),
                             ),
@@ -1290,6 +1441,7 @@ impl ImageCacheStore {
         self.completed_loads.clear();
         self.rasterized_vector_images.clear();
         let _ = self.broken_image_icon_image.take();
+        self.log_cache_stats_if_enabled("clear");
     }
 }
 
@@ -1310,7 +1462,9 @@ impl ImageCacheImpl {
             load.add_listener(listener);
             return;
         }
-        if let Some(load) = store.completed_loads.values().find(|l| l.id == id) {
+        let last_used = store.next_lru_counter();
+        if let Some(load) = store.completed_loads.values_mut().find(|l| l.id == id) {
+            load.last_used = last_used;
             listener.respond(load.image_response.clone());
             return;
         }
