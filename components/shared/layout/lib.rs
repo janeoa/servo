@@ -1034,6 +1034,10 @@ mod test {
                 width: 100,
                 height: 100,
             },
+            decoded_resolution: ImageMetadata {
+                width: 100,
+                height: 100,
+            },
             format: PixelFormat::BGRA8,
             id: None,
             bytes: Arc::new(vec![1]),
@@ -1072,6 +1076,10 @@ mod test {
         .collect();
         let image = RasterImage {
             metadata: ImageMetadata {
+                width: 100,
+                height: 100,
+            },
+            decoded_resolution: ImageMetadata {
                 width: 100,
                 height: 100,
             },
