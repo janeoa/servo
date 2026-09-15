@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use app_units::{AU_PER_PX, Au};
 use clip::Clip;
-pub(crate) use clip::ClipId;
+pub(crate) use clip::{ClipId, StackingContextTreeClipStore};
 use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
 use fonts::ShapedTextSlice;
 use gradient::WebRenderGradient;
@@ -54,7 +54,7 @@ use webrender_api::{
 };
 use wr::units::LayoutVector2D;
 
-use crate::context::{ImageResolver, ResolvedImage};
+use crate::context::{ImageResolver, RasterDecodeCandidate, ResolvedImage};
 use crate::display_list::background::BackgroundPainter;
 use crate::display_list::conversions::FilterToWebRender;
 pub(crate) use crate::display_list::conversions::ToWebRender;
@@ -174,6 +174,31 @@ impl InspectorHighlight {
 }
 
 impl DisplayListBuilder<'_> {
+    fn register_raster_decode_candidate(
+        &self,
+        image: &net_traits::image_cache::Image,
+        size: DeviceIntSize,
+        bounds: LayoutRect,
+        clip_rect: LayoutRect,
+        spatial_id: ScrollTreeNodeId,
+        clip_id: ClipId,
+    ) {
+        let net_traits::image_cache::Image::Encoded(source) = image else {
+            return;
+        };
+        self.image_resolver
+            .raster_decode_candidates
+            .lock()
+            .push(RasterDecodeCandidate {
+                id: source.id,
+                size,
+                bounds,
+                clip_rect,
+                spatial_id,
+                clip_id,
+            });
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn build(
         stacking_context_tree: &mut StackingContextTree,
@@ -854,10 +879,14 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                 (size.width.to_f32_px() * scale).ceil() as i32,
                 (size.height.to_f32_px() * scale).ceil() as i32,
             );
-            self.image_resolver
-                .raster_decode_demands
-                .lock()
-                .push((source.id, requested));
+            self.register_raster_decode_candidate(
+                &net_traits::image_cache::Image::Encoded(source.clone()),
+                requested,
+                rect,
+                common.clip_rect,
+                state.spatial_id,
+                state.clip_id,
+            );
             self.image_resolver
                 .image_cache
                 .demand_driven_raster_image_key(source.id)
@@ -1863,15 +1892,23 @@ impl<'a> BuilderForBoxFragment<'a> {
                         .to_i32()
                     });
 
-                    let Some(image_key) = builder.image_resolver.image_key_from_cached_image(
-                        &image,
-                        preferred_size.unwrap_or(default_size),
-                        node,
-                    ) else {
-                        continue;
-                    };
-
                     if let Some(layer) = layer {
+                        let requested_size = preferred_size.unwrap_or(default_size);
+                        builder.register_raster_decode_candidate(
+                            &image,
+                            requested_size,
+                            layer.bounds,
+                            layer.common.clip_rect,
+                            painter.scroll_tree_node_id(builder, state, index),
+                            state.clip_id,
+                        );
+                        let Some(image_key) = builder.image_resolver.image_key_from_cached_image(
+                            &image,
+                            requested_size,
+                            node,
+                        ) else {
+                            continue;
+                        };
                         let needs_blending = layer.blend_mode != BackgroundBlendMode::Normal;
                         if needs_blending {
                             push_stacking_context(builder, layer.blend_mode, Default::default());
@@ -2104,6 +2141,14 @@ impl<'a> BuilderForBoxFragment<'a> {
             Ok(ResolvedImage::Image { image, size }) => {
                 let scale = builder.device_pixel_ratio.get();
                 let raster_size = Size2D::new(size.width * scale, size.height * scale).to_i32();
+                builder.register_raster_decode_candidate(
+                    &image,
+                    raster_size,
+                    border_image_area.to_box2d(),
+                    common.clip_rect,
+                    state.spatial_id,
+                    state.clip_id,
+                );
                 let Some(key) =
                     builder
                         .image_resolver

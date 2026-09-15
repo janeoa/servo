@@ -372,6 +372,9 @@ pub struct Preferences {
     /// The weight of the http memory cache
     /// Notice that this is not equal to the number of different urls in the cache.
     pub network_http_cache_size: u64,
+    /// Maximum decoded bytes retained for layout-driven static raster images in one pipeline.
+    /// A value of zero disables budget-based eviction.
+    pub network_image_cache_eviction_threshold_bytes: u64,
     pub network_local_directory_listing_enabled: bool,
     /// Force the use of `rust-webpki` verification for CA roots. If this is false (the
     /// default), then `rustls-platform-verifier` will be used, except on Android where
@@ -589,6 +592,7 @@ impl Preferences {
             network_https_proxy_uri: String::new(),
             network_http_no_proxy: String::new(),
             network_http_cache_size: 5000,
+            network_image_cache_eviction_threshold_bytes: 300 * 1024 * 1024,
             network_local_directory_listing_enabled: true,
             network_use_webpki_roots: false,
             network_max_content_length: 5 * 1024 * 1024,

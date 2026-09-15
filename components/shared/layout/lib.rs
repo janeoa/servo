@@ -328,7 +328,7 @@ pub trait Layout {
     fn set_scroll_offsets_from_renderer(
         &mut self,
         scroll_states: &FxHashMap<ExternalScrollId, LayoutVector2D>,
-    );
+    ) -> Option<Vec<(PendingImageId, DeviceIntSize)>>;
 
     /// Get the scroll offset of the given scroll node with id of [`ExternalScrollId`] or `None` if it does
     /// not exist in the tree.

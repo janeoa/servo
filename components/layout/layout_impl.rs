@@ -28,7 +28,7 @@ use layout_api::{
 };
 use log::{debug, warn};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf, MallocSizeOfOps};
-use net_traits::image_cache::ImageCache;
+use net_traits::image_cache::{ImageCache, PendingImageId};
 use paint_api::CrossProcessPaintApi;
 use paint_api::display_list::{AxesScrollSensitivity, PaintDisplayListInfo, ScrollType};
 use parking_lot::{Mutex, RwLock};
@@ -79,11 +79,14 @@ use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
 use url::Url;
 use webrender_api::ExternalScrollId;
-use webrender_api::units::{DevicePixel, LayoutVector2D};
+use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutRect, LayoutVector2D};
 
 use crate::accessibility_tree::{AccessibilityContext, AccessibilityDamageMap, AccessibilityTree};
-use crate::context::{CachedImageOrError, ImageResolver, LayoutContext};
-use crate::display_list::{DisplayListBuilder, HitTest, PaintTimingHandler, StackingContextTree};
+use crate::context::{CachedImageOrError, ImageResolver, LayoutContext, RasterDecodeCandidate};
+use crate::display_list::{
+    DisplayListBuilder, HitTest, PaintTimingHandler, StackingContextTree,
+    StackingContextTreeClipStore,
+};
 use crate::dom::NodeExt;
 use crate::query::{
     BoxAreaInclusion, find_character_offset_in_fragment_descendants, get_the_text_steps,
@@ -92,7 +95,7 @@ use crate::query::{
     process_current_css_zoom_query, process_effective_overflow_query,
     process_node_scroll_area_request, process_offset_parent_query, process_padding_request,
     process_resolved_font_style_query, process_resolved_style_request,
-    process_scroll_container_query,
+    process_scroll_container_query, transform_f32_rectangle,
 };
 use crate::traversal::{RecalcStyle, compute_damage_and_rebuild_box_tree};
 use crate::{BoxTree, FragmentTree};
@@ -194,6 +197,9 @@ pub struct LayoutThread {
 
     /// The [`StackingContextTree`] cached from previous layouts.
     stacking_context_tree: RefCell<Option<StackingContextTree>>,
+
+    /// Encoded raster uses retained with the current display list for viewport-demand updates.
+    raster_decode_candidates: RefCell<Vec<RasterDecodeCandidate>>,
 
     // A cache that maps image resources specified in CSS (e.g as the `url()` value
     // for `background-image` or `content` properties) to either the final resolved
@@ -695,17 +701,18 @@ impl Layout for LayoutThread {
     fn set_scroll_offsets_from_renderer(
         &mut self,
         scroll_states: &FxHashMap<ExternalScrollId, LayoutVector2D>,
-    ) {
+    ) -> Option<Vec<(PendingImageId, DeviceIntSize)>> {
         let mut stacking_context_tree = self.stacking_context_tree.borrow_mut();
         let Some(stacking_context_tree) = stacking_context_tree.as_mut() else {
             warn!("Received scroll offsets before finishing layout.");
-            return;
+            return None;
         };
 
         let offsets = stacking_context_tree
             .paint_info
             .scroll_tree
             .set_all_scroll_offsets(scroll_states);
+        let scroll_offsets_changed = !offsets.is_empty();
 
         // Accessibility node bounds are relative to the viewport origin, so a renderer scroll
         // makes every one of them stale without any reflow occurring. Requesting an accessibility
@@ -720,6 +727,14 @@ impl Layout for LayoutThread {
 
             self.set_force_accessibility_update();
         }
+
+        scroll_offsets_changed.then(|| {
+            Self::active_raster_decode_demands(
+                &stacking_context_tree.paint_info,
+                &stacking_context_tree.clip_store,
+                &self.raster_decode_candidates.borrow(),
+            )
+        })
     }
 
     fn scroll_offset(&self, id: ExternalScrollId) -> Option<LayoutVector2D> {
@@ -775,6 +790,61 @@ impl Layout for LayoutThread {
 }
 
 impl LayoutThread {
+    fn active_raster_decode_demands(
+        paint_info: &PaintDisplayListInfo,
+        clip_store: &StackingContextTreeClipStore,
+        candidates: &[RasterDecodeCandidate],
+    ) -> Vec<(net_traits::image_cache::PendingImageId, DeviceIntSize)> {
+        let viewport_size = paint_info.viewport_details.layout_size();
+        let active_viewport = LayoutRect::from_size(viewport_size)
+            .to_rect()
+            .inflate(viewport_size.width, viewport_size.height);
+        let scroll_tree = &paint_info.scroll_tree;
+
+        candidates
+            .iter()
+            .filter(|candidate| {
+                let transform_rect = |rect: LayoutRect, spatial_id| {
+                    transform_f32_rectangle(
+                        rect.to_rect(),
+                        scroll_tree.cumulative_node_to_root_transform(spatial_id),
+                    )
+                };
+
+                let Some(mut visible_rect) = transform_rect(candidate.bounds, candidate.spatial_id)
+                else {
+                    // Projection failures are treated conservatively so that unusual transforms
+                    // cannot cause a visible image to be evicted.
+                    return true;
+                };
+
+                if let Some(clip_rect) = transform_rect(candidate.clip_rect, candidate.spatial_id) {
+                    let Some(intersection) = visible_rect.intersection(&clip_rect) else {
+                        return false;
+                    };
+                    visible_rect = intersection;
+                }
+
+                let mut clip_id = candidate.clip_id;
+                while clip_id != crate::display_list::ClipId::INVALID {
+                    let clip = &clip_store.0[clip_id.0];
+                    if let Some(clip_rect) = transform_rect(clip.rect, clip.parent_scroll_node_id) {
+                        let Some(intersection) = visible_rect.intersection(&clip_rect) else {
+                            return false;
+                        };
+                        visible_rect = intersection;
+                    }
+                    clip_id = clip.parent_clip_id;
+                }
+
+                visible_rect
+                    .intersection(&active_viewport)
+                    .is_some_and(|intersection| !intersection.is_empty())
+            })
+            .map(|candidate| (candidate.id, candidate.size))
+            .collect()
+    }
+
     fn new(config: LayoutConfig) -> LayoutThread {
         // Let webrender know about this pipeline by sending an empty display list.
         config
@@ -832,6 +902,7 @@ impl LayoutThread {
             box_tree: Default::default(),
             fragment_tree: Default::default(),
             stacking_context_tree: Default::default(),
+            raster_decode_candidates: Default::default(),
             paint_api: config.paint_api,
             stylist: Stylist::new(device, QuirksMode::NoQuirks),
             resolved_images_cache: Default::default(),
@@ -1025,9 +1096,20 @@ impl LayoutThread {
             // We can skip layout, but we might need to update a scroll node.
             return self
                 .handle_update_scroll_node_request(&reflow_request)
-                .then(|| ReflowResult {
-                    reflow_phases_run: ReflowPhasesRun::UpdatedScrollNodeOffset,
-                    ..Default::default()
+                .then(|| {
+                    let raster_decode_demands =
+                        self.stacking_context_tree.borrow().as_ref().map(|tree| {
+                            Self::active_raster_decode_demands(
+                                &tree.paint_info,
+                                &tree.clip_store,
+                                &self.raster_decode_candidates.borrow(),
+                            )
+                        });
+                    ReflowResult {
+                        reflow_phases_run: ReflowPhasesRun::UpdatedScrollNodeOffset,
+                        raster_decode_demands,
+                        ..Default::default()
+                    }
                 });
         }
 
@@ -1048,7 +1130,7 @@ impl LayoutThread {
             image_cache: self.image_cache.clone(),
             resolved_images_cache: self.resolved_images_cache.clone(),
             pending_images: Mutex::default(),
-            raster_decode_demands: Mutex::default(),
+            raster_decode_candidates: Mutex::default(),
             pending_rasterization_images: Mutex::default(),
             pending_svg_elements_for_serialization: Mutex::default(),
             animating_images: reflow_request.animating_images.clone(),
@@ -1099,8 +1181,22 @@ impl LayoutThread {
             reflow_phases_run,
             pending_images,
             raster_decode_demands: reflow_phases_run
-                .contains(ReflowPhasesRun::BuiltDisplayList)
-                .then(|| std::mem::take(&mut *image_resolver.raster_decode_demands.lock())),
+                .intersects(
+                    ReflowPhasesRun::BuiltDisplayList | ReflowPhasesRun::UpdatedScrollNodeOffset,
+                )
+                .then(|| {
+                    self.stacking_context_tree
+                        .borrow()
+                        .as_ref()
+                        .map(|tree| {
+                            Self::active_raster_decode_demands(
+                                &tree.paint_info,
+                                &tree.clip_store,
+                                &self.raster_decode_candidates.borrow(),
+                            )
+                        })
+                        .unwrap_or_default()
+                }),
             pending_rasterization_images,
             pending_svg_elements_for_serialization,
             iframe_sizes: Some(iframe_sizes),
@@ -1537,6 +1633,8 @@ impl LayoutThread {
             paint_timing_handler,
             reflow_statistics,
         );
+        *self.raster_decode_candidates.borrow_mut() =
+            std::mem::take(&mut *image_resolver.raster_decode_candidates.lock());
         stacking_context_tree.paint_info.paint_timing_report =
             paint_timing_handler.mark_paint_timing(reflow_request.halt_lcp);
 
@@ -1633,6 +1731,7 @@ impl LayoutThread {
         self.box_tree.borrow_mut().take();
         self.fragment_tree.borrow_mut().take();
         self.stacking_context_tree.borrow_mut().take();
+        self.raster_decode_candidates.borrow_mut().clear();
 
         // Send empty display list.
         let paint_info = PaintDisplayListInfo::new(
@@ -1993,6 +2092,102 @@ impl ReflowPhases {
                 Self::StackingContextTreeConstruction | Self::DisplayListConstruction
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod raster_decode_visibility_tests {
+    use embedder_traits::ViewportDetails;
+    use euclid::{Scale, Size2D};
+    use paint_api::display_list::{AxesScrollSensitivity, PaintDisplayListInfo, ScrollType};
+    use rustc_hash::FxHashMap;
+    use servo_base::id::TEST_PIPELINE_ID;
+    use webrender_api::units::{
+        DeviceIntSize, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D,
+    };
+    use webrender_api::{BorderRadius, ExternalScrollId};
+
+    use super::{LayoutThread, RasterDecodeCandidate, StackingContextTreeClipStore};
+    use crate::display_list::ClipId;
+
+    fn paint_info() -> PaintDisplayListInfo {
+        PaintDisplayListInfo::new(
+            ViewportDetails {
+                size: Size2D::new(100.0, 100.0),
+                hidpi_scale_factor: Scale::new(1.0),
+                device_size: Size2D::new(100.0, 100.0),
+            },
+            LayoutSize::new(100.0, 1000.0),
+            TEST_PIPELINE_ID.into(),
+            Default::default(),
+            AxesScrollSensitivity {
+                x: ScrollType::InputEvents | ScrollType::Script,
+                y: ScrollType::InputEvents | ScrollType::Script,
+            },
+            false,
+        )
+    }
+
+    fn candidate(
+        paint_info: &PaintDisplayListInfo,
+        y: f32,
+        clip_id: ClipId,
+    ) -> RasterDecodeCandidate {
+        let bounds =
+            LayoutRect::from_origin_and_size(LayoutPoint::new(0.0, y), LayoutSize::new(10.0, 10.0));
+        RasterDecodeCandidate {
+            id: net_traits::image_cache::PendingImageId(1),
+            size: DeviceIntSize::new(10, 10),
+            bounds,
+            clip_rect: bounds,
+            spatial_id: paint_info.root_scroll_node_id,
+            clip_id,
+        }
+    }
+
+    #[test]
+    fn viewport_margin_and_scroll_offsets_control_demands() {
+        let mut paint_info = paint_info();
+        let candidate = candidate(&paint_info, 201.0, ClipId::INVALID);
+        let clips = StackingContextTreeClipStore::default();
+        assert!(
+            LayoutThread::active_raster_decode_demands(&paint_info, &clips, &[candidate.clone()])
+                .is_empty()
+        );
+
+        let mut offsets = FxHashMap::default();
+        offsets.insert(
+            ExternalScrollId(0, TEST_PIPELINE_ID.into()),
+            LayoutVector2D::new(0.0, 100.0),
+        );
+        paint_info.scroll_tree.set_all_scroll_offsets(&offsets);
+        assert_eq!(
+            LayoutThread::active_raster_decode_demands(&paint_info, &clips, &[candidate]),
+            vec![(
+                net_traits::image_cache::PendingImageId(1),
+                DeviceIntSize::new(10, 10)
+            )]
+        );
+    }
+
+    #[test]
+    fn ancestor_clip_excludes_geometrically_hidden_image() {
+        let paint_info = paint_info();
+        let mut clips = StackingContextTreeClipStore::default();
+        let clip_id = clips.add(
+            BorderRadius::zero(),
+            LayoutRect::from_origin_and_size(
+                LayoutPoint::new(50.0, 50.0),
+                LayoutSize::new(10.0, 10.0),
+            ),
+            paint_info.root_scroll_node_id,
+            ClipId::INVALID,
+        );
+        let candidate = candidate(&paint_info, 0.0, clip_id);
+        assert!(
+            LayoutThread::active_raster_decode_demands(&paint_info, &clips, &[candidate])
+                .is_empty()
+        );
     }
 }
 

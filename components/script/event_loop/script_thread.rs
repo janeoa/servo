@@ -1938,15 +1938,18 @@ impl ScriptThread {
             return;
         };
 
-        self.profile_event(
+        let raster_decode_demands = self.profile_event(
             ScriptThreadEventCategory::SetScrollState,
             Some(pipeline_id),
             || {
                 window
                     .layout_mut()
-                    .set_scroll_offsets_from_renderer(&scroll_states.offsets);
+                    .set_scroll_offsets_from_renderer(&scroll_states.offsets)
             },
         );
+        if let Some(demands) = raster_decode_demands {
+            window.update_raster_decode_demands(demands);
+        }
 
         window
             .Document()

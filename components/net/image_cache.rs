@@ -514,6 +514,54 @@ struct DemandDrivenRasterEntry {
     pending_generation: Option<u64>,
     decoding: bool,
     failed_target: Option<ImageMetadata>,
+    /// The last complete viewport-demand update in which this image was active.
+    last_active_epoch: u64,
+}
+
+fn select_inactive_raster_evictions(
+    entries: impl IntoIterator<Item = (PendingImageId, bool, u64, u64)>,
+    limit: u64,
+) -> (Vec<PendingImageId>, u64) {
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    let mut decoded_bytes = entries.iter().map(|(_, _, _, bytes)| bytes).sum::<u64>();
+    if limit == 0 || decoded_bytes <= limit {
+        return (vec![], decoded_bytes);
+    }
+
+    let mut candidates = entries
+        .into_iter()
+        .filter(|(_, active, _, _)| !active)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(id, _, epoch, _)| (*epoch, id.0));
+
+    let mut victims = Vec::new();
+    for (id, _, _, bytes) in candidates {
+        if decoded_bytes <= limit {
+            break;
+        }
+        victims.push(id);
+        decoded_bytes = decoded_bytes.saturating_sub(bytes);
+    }
+    (victims, decoded_bytes)
+}
+
+#[cfg(feature = "test-util")]
+/// Exposes the pure LRU selection policy to the integration test crate.
+#[doc(hidden)]
+pub fn select_inactive_raster_evictions_for_testing(
+    entries: Vec<(u64, bool, u64, u64)>,
+    limit: u64,
+) -> (Vec<u64>, u64) {
+    let (victims, remaining) = select_inactive_raster_evictions(
+        entries
+            .into_iter()
+            .map(|(id, active, epoch, bytes)| (PendingImageId(id), active, epoch, bytes)),
+        limit,
+    );
+    (
+        victims.into_iter().map(|victim| victim.0).collect(),
+        remaining,
+    )
 }
 
 /// Select a decode target for the current display demand. Compare only the
@@ -560,6 +608,7 @@ struct ImageCacheStore {
     completed_loads: HashMap<ImageKey, CompletedLoad>,
 
     encoded_raster_images: FxHashMap<PendingImageId, DemandDrivenRasterEntry>,
+    raster_usage_epoch: u64,
     cache_clear_count: u64,
     #[ignore_malloc_size_of = "Callbacks cannot be measured"]
     raster_decode_callback: Option<ImageCacheResponseCallback>,
@@ -596,6 +645,60 @@ struct ImageCacheStore {
 }
 
 impl ImageCacheStore {
+    fn evict_inactive_decoded_rasters_if_needed(&mut self) {
+        let limit = pref!(network_image_cache_eviction_threshold_bytes);
+        if limit == 0 {
+            return;
+        }
+
+        let decoded_entries = self
+            .encoded_raster_images
+            .iter()
+            .filter_map(|(&id, entry)| {
+                let image = entry.image.as_ref()?;
+                Some((
+                    id,
+                    entry.target.is_some(),
+                    entry.last_active_epoch,
+                    image.bytes.len() as u64,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let (victims, decoded_bytes) = select_inactive_raster_evictions(decoded_entries, limit);
+
+        let mut deletions = Vec::new();
+        let mut evicted_bytes = 0;
+        for id in victims {
+            let Some(entry) = self.encoded_raster_images.get_mut(&id) else {
+                continue;
+            };
+            let Some(image) = entry.image.take() else {
+                continue;
+            };
+            if let Some(key) = image.id {
+                deletions.push(ImageUpdate::DeleteImage(key));
+            }
+            entry.completed_generation = None;
+            entry.pending_generation = None;
+            evicted_bytes += image.bytes.len() as u64;
+        }
+
+        if !deletions.is_empty() {
+            self.paint_api
+                .update_images(self.webview_id.into(), deletions.into());
+            debug!(
+                "Evicted {} bytes of inactive decoded raster images; {} bytes remain (limit {})",
+                evicted_bytes, decoded_bytes, limit
+            );
+        }
+        if decoded_bytes > limit {
+            debug!(
+                "Active decoded raster working set exceeds cache limit: {} bytes (limit {})",
+                decoded_bytes, limit
+            );
+        }
+    }
+
     #[cfg(feature = "test-util")]
     fn number_of_rasterize_tasks(&self) -> usize {
         self.svg_rasterization_task_store.0.len()
@@ -646,6 +749,7 @@ impl ImageCacheStore {
                         generation,
                     ));
                 }
+                self.evict_inactive_decoded_rasters_if_needed();
             },
             PendingKey::RasterImage((pending_id, mut raster_image)) => {
                 // We can have concurrent sync and async loads for the same image, so if it's
@@ -800,6 +904,7 @@ impl ImageCacheStore {
                         pending_generation: None,
                         decoding: false,
                         failed_target: None,
+                        last_active_epoch: 0,
                     },
                 );
                 ImageResponse::Loaded(Image::Encoded(source), url.unwrap())
@@ -1014,6 +1119,7 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
                 pending_loads: AllPendingLoads::new(),
                 completed_loads: HashMap::new(),
                 encoded_raster_images: FxHashMap::default(),
+                raster_usage_epoch: 0,
                 cache_clear_count: 0,
                 raster_decode_callback: None,
                 vector_images: FxHashMap::default(),
@@ -1195,6 +1301,8 @@ impl ImageCache for ImageCacheImpl {
     ) -> Vec<RasterDecodeDemandStatus> {
         let mut store = self.store.lock();
         store.raster_decode_callback = Some(callback);
+        store.raster_usage_epoch = store.raster_usage_epoch.saturating_add(1);
+        let usage_epoch = store.raster_usage_epoch;
         let mut requirements: FxHashMap<PendingImageId, ImageMetadata> = FxHashMap::default();
         for (id, size) in demands {
             if size.width <= 0 || size.height <= 0 {
@@ -1215,7 +1323,6 @@ impl ImageCache for ImageCacheImpl {
                 })
                 .or_insert(required);
         }
-        let paint_api = store.paint_api.clone();
         let mut jobs = vec![];
         let mut statuses = vec![];
         for (&id, entry) in &mut store.encoded_raster_images {
@@ -1230,13 +1337,9 @@ impl ImageCache for ImageCacheImpl {
                 entry.target = target;
                 entry.generation += 1;
                 entry.pending_generation = None;
-                if target.is_none() {
-                    if let Some(key) = entry.image.take().and_then(|image| image.id) {
-                        paint_api.delete_image(key);
-                    }
-                }
             }
             if let Some(target) = target {
+                entry.last_active_epoch = usage_epoch;
                 if entry
                     .image
                     .as_ref()
@@ -1254,6 +1357,7 @@ impl ImageCache for ImageCacheImpl {
             jobs.push(id);
         }
         store.prune_stale_demand_decode_pending_keys();
+        store.evict_inactive_decoded_rasters_if_needed();
         drop(store);
         for id in jobs {
             start_demand_decode(self.store.clone(), self.thread_pool.clone(), id);
