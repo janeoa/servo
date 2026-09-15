@@ -48,6 +48,23 @@ pub(super) struct BackgroundPainter<'a> {
 }
 
 impl<'a> BackgroundPainter<'a> {
+    pub(super) fn scroll_tree_node_id(
+        &self,
+        builder: &DisplayListBuilder,
+        state: &TraversalState,
+        layer_index: usize,
+    ) -> servo_base::id::ScrollTreeNodeId {
+        if get_cyclic(
+            &self.style.get_background().background_attachment.0,
+            layer_index,
+        ) == &BackgroundAttachment::Fixed
+        {
+            builder.current_reference_frame_scroll_node_id
+        } else {
+            state.spatial_id
+        }
+    }
+
     /// Get the painting area for this background, which is the actual rectangle in the
     /// current coordinate system that the background will be painted.
     pub(super) fn painting_area(
@@ -131,7 +148,8 @@ impl<'a> BackgroundPainter<'a> {
         if &BackgroundAttachment::Fixed ==
             get_cyclic(&style.get_background().background_attachment.0, layer_index)
         {
-            common.spatial_id = builder.spatial_id(builder.current_reference_frame_scroll_node_id);
+            common.spatial_id =
+                builder.spatial_id(self.scroll_tree_node_id(builder, state, layer_index));
         }
         common
     }

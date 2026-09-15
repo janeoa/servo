@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use malloc_size_of_derive::MallocSizeOf;
-use net::image_cache::ImageCacheFactoryImpl;
+use net::image_cache::{ImageCacheFactoryImpl, select_inactive_raster_evictions_for_testing};
 use net_traits::image_cache::{
     EncodedImage, EncodedImageBytes, FontResolver, ImageCache, ImageCacheFactory,
     ImageCacheResponseMessage, ImageCacheResult, ImageLoadListener, ImageOrMetadataAvailable,
@@ -87,6 +87,38 @@ fn create_test_listener(id: PendingImageId, sender: Sender<ImageResponse>) -> Im
         }
     });
     ImageLoadListener::new(callback, TEST_PIPELINE_ID, id)
+}
+
+#[test]
+fn test_inactive_raster_eviction_order() {
+    let entries = vec![(1, false, 1, 40), (2, false, 3, 40), (3, false, 2, 40)];
+    let (victims, remaining) = select_inactive_raster_evictions_for_testing(entries, 50);
+    assert_eq!(victims, vec![1, 3]);
+    assert_eq!(remaining, 40);
+}
+
+#[test]
+fn test_inactive_rasters_remain_cached_below_limit() {
+    let entries = vec![(1, false, 1, 40)];
+    let (victims, remaining) = select_inactive_raster_evictions_for_testing(entries, 50);
+    assert!(victims.is_empty());
+    assert_eq!(remaining, 40);
+}
+
+#[test]
+fn test_active_rasters_are_pinned_over_budget() {
+    let entries = vec![(1, true, 1, 80), (2, false, 2, 40)];
+    let (victims, remaining) = select_inactive_raster_evictions_for_testing(entries, 50);
+    assert_eq!(victims, vec![2]);
+    assert_eq!(remaining, 80);
+}
+
+#[test]
+fn test_zero_raster_cache_limit_disables_eviction() {
+    let entries = vec![(1, false, 1, 80)];
+    let (victims, remaining) = select_inactive_raster_evictions_for_testing(entries, 0);
+    assert!(victims.is_empty());
+    assert_eq!(remaining, 80);
 }
 
 fn jpeg_image_bytes() -> Vec<u8> {
