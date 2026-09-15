@@ -16,10 +16,10 @@ use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf as MallocSizeOfTrait,
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
 use net_traits::image_cache::{
-    EncodedImage, FontResolver, Image, ImageCache, ImageCacheFactory, ImageCacheResponseCallback,
-    ImageCacheResponseMessage, ImageCacheResult, ImageLoadListener, ImageOrMetadataAvailable,
-    ImageResponse, PendingImageId, RasterDecodeDemandStatus, RasterizationCompleteResponse,
-    VectorImage,
+    EncodedImage, EncodedImageBytes, FontResolver, Image, ImageCache, ImageCacheFactory,
+    ImageCacheResponseCallback, ImageCacheResponseMessage, ImageCacheResult, ImageLoadListener,
+    ImageOrMetadataAvailable, ImageResponse, PendingImageId, RasterDecodeDemandStatus,
+    RasterizationCompleteResponse, VectorImage,
 };
 use net_traits::request::CorsSettings;
 use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
@@ -31,6 +31,7 @@ use profile_traits::path;
 use resvg::tiny_skia;
 use resvg::usvg::{self, fontdb};
 use rustc_hash::{FxHashMap, FxHashSet};
+use servo_arc::Arc as ServoArc;
 use servo_base::id::{PipelineId, WebViewId};
 use servo_base::threadpool::ThreadPool;
 use servo_config::pref;
@@ -351,6 +352,10 @@ struct PendingLoad {
     /// is complete and the buffer has been transmitted to the decoder.
     bytes: ImageBytes,
 
+    /// The completed HTTP response body, when the fetch path retained one.
+    #[ignore_malloc_size_of = "shared with the HTTP cache"]
+    encoded_body: Option<ServoArc<Mutex<net_traits::response::ResponseBody>>>,
+
     /// Image metadata, if available.
     metadata: Option<ImageMetadata>,
 
@@ -388,6 +393,7 @@ impl PendingLoad {
     ) -> PendingLoad {
         PendingLoad {
             bytes: ImageBytes::InProgress(vec![]),
+            encoded_body: None,
             metadata: None,
             result: None,
             listeners: vec![],
@@ -927,7 +933,11 @@ impl ImageCacheStore {
                     id: msg.key,
                     metadata: raster_image.metadata,
                     cors_status: raster_image.cors_status,
-                    bytes: bytes.clone(),
+                    bytes: pending
+                        .encoded_body
+                        .clone()
+                        .map(EncodedImageBytes::Cached)
+                        .unwrap_or_else(|| EncodedImageBytes::Owned(bytes.clone())),
                 }))
             },
             Some(DecodedImage::Vector(vector_image_data)) => {
@@ -1528,7 +1538,7 @@ impl ImageCache for ImageCacheImpl {
                     debug!("Pending load for id {:?} already evicted from cache", id);
                 }
             },
-            (FetchResponseMsg::ProcessResponseEOF(_, result, _), key) => {
+            (FetchResponseMsg::ProcessResponseEOF(_, result, _, encoded_body), key) => {
                 debug!("Received EOF for {:?}", key);
                 match result {
                     Ok(_) => {
@@ -1537,6 +1547,7 @@ impl ImageCache for ImageCacheImpl {
                             let cache_clear_count = store.cache_clear_count;
                             if let Some(pending_load) = store.pending_loads.get_by_key_mut(&id) {
                                 pending_load.result = Some(Ok(()));
+                                pending_load.encoded_body = encoded_body;
                                 debug!("Async decoding {} ({:?})", pending_load.url, key);
                                 (
                                     pending_load.bytes.mark_complete(),
@@ -1738,11 +1749,7 @@ fn start_demand_decode(
                 height: target.height,
             }
         };
-        let decoded = pixels::load_from_memory_with_target(
-            &source.bytes,
-            source.cors_status,
-            Some(decode_target),
-        );
+        let decoded = source.decode_with_target(decode_target);
         {
             let mut cache = store.lock();
             let Some(entry) = cache.encoded_raster_images.get_mut(&id) else {
