@@ -19,7 +19,7 @@ use net_traits::request::InternalRequest;
 use parking_lot::{Mutex, RwLock};
 use pixels::RasterImage;
 use script::layout_dom::ServoLayoutNode;
-use servo_base::id::PainterId;
+use servo_base::id::{PainterId, ScrollTreeNodeId};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::context::SharedStyleContext;
 use style::dom::OpaqueNode;
@@ -28,7 +28,9 @@ use style::values::computed::image::{Gradient, Image};
 use style_traits::DevicePixel;
 use uuid::Uuid;
 use webrender_api::ImageKey;
-use webrender_api::units::{DeviceIntSize, DeviceSize};
+use webrender_api::units::{DeviceIntSize, DeviceSize, LayoutRect};
+
+use crate::display_list::ClipId;
 
 pub(crate) type CachedImageOrError = Result<CachedImage, ResolveImageError>;
 
@@ -106,6 +108,19 @@ pub(crate) enum LayoutImageCacheResult {
     LoadError,
 }
 
+/// Geometry needed to decide whether a display-sized raster decode is close enough to a
+/// viewport to be active. These records are retained with the display list and re-evaluated
+/// whenever compositor scroll offsets change.
+#[derive(Clone, Debug)]
+pub(crate) struct RasterDecodeCandidate {
+    pub id: PendingImageId,
+    pub size: DeviceIntSize,
+    pub bounds: LayoutRect,
+    pub clip_rect: LayoutRect,
+    pub spatial_id: ScrollTreeNodeId,
+    pub clip_id: ClipId,
+}
+
 pub(crate) struct ImageResolver {
     /// The origin of the `Document` that this [`ImageResolver`] resolves images for.
     pub origin: ImmutableOrigin,
@@ -116,8 +131,8 @@ pub(crate) struct ImageResolver {
     /// A list of in-progress image loads to be shared with the script thread.
     pub pending_images: Mutex<Vec<PendingImage>>,
 
-    /// Complete display-list demands, including uses in retained fragments.
-    pub raster_decode_demands: Mutex<Vec<(PendingImageId, DeviceIntSize)>>,
+    /// Complete display-list image geometry, including uses in retained fragments.
+    pub raster_decode_candidates: Mutex<Vec<RasterDecodeCandidate>>,
 
     /// A list of fully loaded vector images that need to be rasterized to a specific
     /// size determined by layout. This will be shared with the script thread.
@@ -292,7 +307,6 @@ impl ImageResolver {
         match image {
             CachedImage::Raster(raster_image) => raster_image.id,
             CachedImage::Encoded(source) => {
-                self.raster_decode_demands.lock().push((source.id, size));
                 self.image_cache.demand_driven_raster_image_key(source.id)
             },
             CachedImage::Vector(vector_image) => node.and_then(|node| {

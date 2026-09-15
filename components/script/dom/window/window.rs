@@ -801,6 +801,36 @@ impl Window {
         self.layout().set_needs_new_display_list();
     }
 
+    pub(crate) fn update_raster_decode_demands(
+        &self,
+        demands: Vec<(PendingImageId, DeviceIntSize)>,
+    ) {
+        let sender = self.image_cache_sender.clone();
+        let statuses = self.image_cache().set_raster_decode_demands(
+            demands,
+            Box::new(move |message| {
+                let _ = sender.send(message);
+            }),
+        );
+        let statuses: FxHashMap<_, _> = statuses
+            .into_iter()
+            .map(|status| (status.id, status))
+            .collect();
+        let mut pending = self.pending_encoded_raster_images.borrow_mut();
+        // Keep completed requests until script handles their queued callback, so screenshots
+        // cannot race an upload and capture an old display list.
+        pending.retain(|id, generation| {
+            statuses
+                .get(id)
+                .is_some_and(|status| status.counter == *generation)
+        });
+        for status in statuses.into_values() {
+            if status.pending {
+                pending.insert(status.id, status.counter);
+            }
+        }
+    }
+
     pub(crate) fn handle_image_rasterization_complete_notification(
         &self,
         no_gc: &NoGC,
@@ -2775,30 +2805,7 @@ impl Window {
         self.handle_new_or_removed_web_fonts_post_reflow(cx, reflow_result.changed_web_fonts);
 
         if let Some(demands) = reflow_result.raster_decode_demands {
-            let sender = self.image_cache_sender.clone();
-            let statuses = self.image_cache().set_raster_decode_demands(
-                demands,
-                Box::new(move |message| {
-                    let _ = sender.send(message);
-                }),
-            );
-            let statuses: FxHashMap<_, _> = statuses
-                .into_iter()
-                .map(|status| (status.id, status))
-                .collect();
-            let mut pending = self.pending_encoded_raster_images.borrow_mut();
-            // Keep completed requests until script handles their queued callback,
-            // so screenshots cannot race an upload and capture an old display list.
-            pending.retain(|id, generation| {
-                statuses
-                    .get(id)
-                    .is_some_and(|status| status.counter == *generation)
-            });
-            for status in statuses.into_values() {
-                if status.pending {
-                    pending.insert(status.id, status.counter);
-                }
-            }
+            self.update_raster_decode_demands(demands);
         }
 
         self.handle_pending_images_post_reflow(
