@@ -25,7 +25,10 @@ use net_traits::request::CorsSettings;
 use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
 use paint_api::{CrossProcessPaintApi, ImageUpdate, SerializableImageData};
 use parking_lot::Mutex;
-use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, load_from_memory};
+use pixels::{
+    CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, image_metadata_from_memory,
+    load_from_memory,
+};
 use profile_traits::mem::{Report, ReportKind};
 use profile_traits::path;
 use resvg::tiny_skia;
@@ -120,6 +123,14 @@ fn decode_bytes_sync(
                     cors_status: cors,
                 })
             })
+    } else if pref!(image_layout_driven_decode_downscaling_enabled) {
+        image_metadata_from_memory(bytes).and_then(|(metadata, is_animated)| {
+            if is_animated {
+                load_from_memory(bytes, cors).map(DecodedImage::Raster)
+            } else {
+                Some(DecodedImage::Encoded(metadata, cors))
+            }
+        })
     } else {
         load_from_memory(bytes, cors).map(DecodedImage::Raster)
     };
@@ -270,6 +281,7 @@ impl std::fmt::Debug for VectorImageData {
 }
 
 enum DecodedImage {
+    Encoded(ImageMetadata, CorsStatus),
     Raster(RasterImage),
     Vector(VectorImageData),
 }
@@ -654,6 +666,14 @@ struct ImageCacheStore {
 }
 
 impl ImageCacheStore {
+    fn decoded_raster_cache_bytes(&self) -> u64 {
+        self.encoded_raster_images
+            .values()
+            .filter_map(|entry| entry.current_decoded_scaled_image.as_ref())
+            .map(|image| image.bytes.len() as u64)
+            .sum()
+    }
+
     fn evict_inactive_decoded_rasters_if_needed(&mut self) {
         let limit = pref!(network_image_cache_eviction_threshold_bytes);
         if limit == 0 {
@@ -689,7 +709,12 @@ impl ImageCacheStore {
             }
             entry.completed = None;
             entry.pending = None;
-            evicted_bytes += image.bytes.len() as u64;
+            let image_bytes = image.bytes.len() as u64;
+            evicted_bytes += image_bytes;
+            debug!(
+                "Evicting demand-decoded raster {id:?}: resolution {:?}, {} bytes, last active epoch {}",
+                image.decoded_resolution, image_bytes, entry.last_active_epoch
+            );
         }
 
         if !deletions.is_empty() {
@@ -755,6 +780,8 @@ impl ImageCacheStore {
                 } else {
                     set_webrender_image_key(&self.paint_api, &mut image, image_key);
                 }
+                let decoded_resolution = image.decoded_resolution;
+                let image_bytes = image.bytes.len() as u64;
                 entry.current_decoded_scaled_image = Some(image);
                 entry.pending = None;
                 entry.completed = Some(generation);
@@ -765,6 +792,11 @@ impl ImageCacheStore {
                         generation,
                     ));
                 }
+                debug!(
+                    "Loaded demand-decoded raster {id:?} generation {generation}: resolution {decoded_resolution:?}, {image_bytes} bytes; cache pressure {} / {} bytes",
+                    self.decoded_raster_cache_bytes(),
+                    pref!(network_image_cache_eviction_threshold_bytes)
+                );
                 self.evict_inactive_decoded_rasters_if_needed();
             },
             PendingKey::RasterImage((pending_id, mut raster_image)) => {
@@ -901,7 +933,7 @@ impl ImageCacheStore {
 
     /// The rest of complete load. This requires that images have a valid WebRender key.
     fn complete_load(&mut self, key: LoadKey, load_result: LoadResult) {
-        debug!("Completed decoding for {:?}", load_result);
+        debug!("Completed image load processing for {:?}", load_result);
         let pending_load = match self.pending_loads.remove(&key) {
             Some(load) => load,
             None => return,
@@ -1043,6 +1075,28 @@ impl ImageCacheStore {
     fn handle_decoder(&mut self, msg: DecoderMsg) {
         let image = match msg.image {
             None => LoadResult::FailedToLoadOrDecode,
+            Some(DecodedImage::Encoded(metadata, cors_status)) => {
+                if msg.cache_clear_count != self.cache_clear_count {
+                    self.pending_loads.remove(&msg.key);
+                    return;
+                }
+                let Some(pending) = self.pending_loads.get_by_key_mut(&msg.key) else {
+                    return;
+                };
+                let ImageBytes::Complete(bytes) = &pending.bytes else {
+                    return;
+                };
+                LoadResult::LoadedEncodedRaster(Arc::new(EncodedImage {
+                    id: msg.key,
+                    metadata,
+                    cors_status,
+                    bytes: pending
+                        .encoded_body
+                        .clone()
+                        .map(EncodedImageBytes::Cached)
+                        .unwrap_or_else(|| EncodedImageBytes::Owned(bytes.clone())),
+                }))
+            },
             Some(DecodedImage::Raster(raster_image)) => {
                 // If the image an animation or the decode_downscale is not enabled -> use full decodes
                 if raster_image.loop_count.is_some() ||
@@ -1691,7 +1745,10 @@ impl ImageCache for ImageCacheImpl {
                             if let Some(pending_load) = store.pending_loads.get_by_key_mut(&id) {
                                 pending_load.result = Some(Ok(()));
                                 pending_load.encoded_body = encoded_body;
-                                debug!("Async decoding {} ({:?})", pending_load.url, key);
+                                debug!(
+                                    "Async image source inspection {} ({:?})",
+                                    pending_load.url, key
+                                );
                                 (
                                     pending_load.bytes.mark_complete(),
                                     pending_load.cors_status,
@@ -1890,6 +1947,10 @@ fn start_demand_decode(
             decode_state.current_counter,
         )
     };
+    debug!(
+        "Starting demand decode for raster {id:?} generation {generation}: source {:?}, target {target:?}",
+        encoded_image_source.metadata
+    );
     let next_pool = pool.clone();
     pool.spawn(move || {
         // The cache already fitted both dimensions. Use only the dominant axis
