@@ -195,6 +195,7 @@ pub(crate) struct DefaultImageDecoder<'a> {
 pub(crate) trait ServoImageDecoder<'a>: Sized + std::fmt::Debug {
     /// Create a decoder for a `format` from a `buffer`.
     fn make_decoder(format: ImageFormat, buffer: &'a [u8]) -> ImageResult<Self>;
+    fn dimensions(&self) -> (u32, u32);
     fn is_animated(&self) -> bool;
     /// Return the created decoder in `impl ImageDecoder`
     fn decoder(self) -> impl ImageDecoder;
@@ -232,6 +233,10 @@ impl<'a> ServoImageDecoder<'a> for DefaultImageDecoder<'a> {
             },
         };
         Ok(DefaultImageDecoder { decoder })
+    }
+
+    fn dimensions(&self) -> (u32, u32) {
+        self.decoder.dimensions()
     }
 
     fn is_animated(&self) -> bool {

@@ -125,6 +125,19 @@ fn jpeg_image_bytes() -> Vec<u8> {
     include_bytes!("test.jpeg").to_vec()
 }
 
+#[test]
+fn test_static_raster_metadata_without_pixel_decode() {
+    let (metadata, is_animated) = pixels::image_metadata_from_memory(&jpeg_image_bytes()).unwrap();
+    assert_eq!(
+        metadata,
+        ImageMetadata {
+            width: 320,
+            height: 427
+        }
+    );
+    assert!(!is_animated);
+}
+
 fn svg_image_bytes() -> Vec<u8> {
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
     <circle cx="50" cy="50" r="40" fill="red"/>
