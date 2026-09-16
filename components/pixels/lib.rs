@@ -544,6 +544,14 @@ pub fn load_from_memory(buffer: &[u8], cors_status: CorsStatus) -> Option<Raster
     load_from_memory_with_target(buffer, cors_status, None)
 }
 
+/// Read the natural dimensions and animation status without decoding pixels.
+pub fn image_metadata_from_memory(buffer: &[u8]) -> Option<(ImageMetadata, bool)> {
+    let format = detect_image_format(buffer).ok()?;
+    let decoder = decoding::DefaultImageDecoder::make_decoder(format, buffer).ok()?;
+    let (width, height) = decoder.dimensions();
+    Some((ImageMetadata { width, height }, decoder.is_animated()))
+}
+
 /// Decode static images at an aspect-preserving display resolution. Animated images
 /// retain their original resolution. Full-resolution decode memory is temporary.
 pub fn load_from_memory_with_target(
