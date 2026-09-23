@@ -793,7 +793,7 @@ impl ImageCacheStore {
                     ));
                 }
                 debug!(
-                    "Loaded demand-decoded raster {id:?} generation {generation}: resolution {decoded_resolution:?}, {image_bytes} bytes; cache pressure {} / {} bytes",
+                    "Loaded demand-decoded raster {id:?} generation {generation:?}: resolution {decoded_resolution:?}, {image_bytes} bytes; cache pressure {} / {} bytes",
                     self.decoded_raster_cache_bytes(),
                     pref!(network_image_cache_eviction_threshold_bytes)
                 );
@@ -1948,7 +1948,7 @@ fn start_demand_decode(
         )
     };
     debug!(
-        "Starting demand decode for raster {id:?} generation {generation}: source {:?}, target {target:?}",
+        "Starting demand decode for raster {id:?} generation {generation:?}: source {:?}, target {target:?}",
         encoded_image_source.metadata
     );
     let next_pool = pool.clone();
