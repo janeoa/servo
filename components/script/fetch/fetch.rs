@@ -758,6 +758,7 @@ impl FetchResponseListener for FetchContext {
         _: RequestId,
         response: Result<(), NetworkError>,
         timing: ResourceFetchTiming,
+        _body: Option<servo_arc::Arc<parking_lot::Mutex<net_traits::response::ResponseBody>>>,
     ) {
         let response_object = self.response_object.root();
         let mut realm = enter_auto_realm(cx, &*response_object);
@@ -825,6 +826,7 @@ impl FetchResponseListener for FetchLaterListener {
         _: RequestId,
         response: Result<(), NetworkError>,
         timing: ResourceFetchTiming,
+        _body: Option<servo_arc::Arc<parking_lot::Mutex<net_traits::response::ResponseBody>>>,
     ) {
         network_listener::submit_timing(cx, &self, &response, &timing);
     }
