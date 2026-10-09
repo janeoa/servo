@@ -360,7 +360,7 @@ struct PendingLoad {
 
     /// The completed HTTP response body, stored as a source of encoded images when possible.
     #[ignore_malloc_size_of = "shared with the HTTP cache"]
-    encoded_body: Option<servo_arc::Arc<Mutex<net_traits::response::ResponseBody>>>,
+    shared_body: Option<servo_arc::Arc<Mutex<net_traits::response::ResponseBody>>>,
 
     /// Image metadata, if available.
     metadata: Option<ImageMetadata>,
@@ -399,7 +399,7 @@ impl PendingLoad {
     ) -> PendingLoad {
         PendingLoad {
             bytes: ImageBytes::InProgress(vec![]),
-            encoded_body: None,
+            shared_body: None,
             metadata: None,
             result: None,
             listeners: vec![],
@@ -959,16 +959,17 @@ impl ImageCacheStore {
                 let ImageBytes::Complete(bytes) = &pending.bytes else {
                     return;
                 };
-                // This stores a shared encoded image source for future on demand decodes.
+                // In case if net is done and the responce has valid body, we pass the body
+                // otherwise, we pass the wrapped vector, which would preserve second allocation.
                 LoadResult::LoadedEncodedRaster(Arc::new(EncodedImage {
                     id: msg.key,
                     metadata: raster_image.metadata,
                     cors_status: raster_image.cors_status,
                     bytes: pending
-                        .encoded_body
+                        .shared_body
                         .clone()
-                        .map(EncodedImageBytes::Cached)
-                        .unwrap_or_else(|| EncodedImageBytes::Owned(bytes.clone())),
+                        .map(EncodedImageBytes::NetResponseBody)
+                        .unwrap_or_else(|| EncodedImageBytes::ImageBufferFallback(bytes.clone())),
                 }))
             },
             Some(DecodedImage::Vector(vector_image_data)) => {
@@ -1578,7 +1579,7 @@ impl ImageCache for ImageCacheImpl {
                     debug!("Pending load for id {:?} already evicted from cache", id);
                 }
             },
-            (FetchResponseMsg::ProcessResponseEOF(_, result, _, encoded_body), key) => {
+            (FetchResponseMsg::ProcessResponseEOF(_, result, _, shared_body), key) => {
                 debug!("Received EOF for {:?}", key);
                 match result {
                     Ok(_) => {
@@ -1587,7 +1588,7 @@ impl ImageCache for ImageCacheImpl {
                             let cache_clear_count = store.cache_clear_count;
                             if let Some(pending_load) = store.pending_loads.get_by_key_mut(&id) {
                                 pending_load.result = Some(Ok(()));
-                                pending_load.encoded_body = encoded_body;
+                                pending_load.shared_body = shared_body;
                                 debug!("Async decoding {} ({:?})", pending_load.url, key);
                                 (
                                     pending_load.bytes.mark_complete(),
