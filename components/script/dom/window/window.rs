@@ -805,6 +805,7 @@ impl Window {
         self.layout().set_needs_new_display_list();
     }
 
+    /// Previously was part of reflow, and now made more common due to LRU also happening on scroll
     pub(crate) fn update_raster_decode_demands(
         &self,
         demands: Vec<(PendingImageId, DeviceIntSize)>,

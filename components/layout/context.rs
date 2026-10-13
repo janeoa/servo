@@ -109,9 +109,8 @@ pub(crate) enum LayoutImageCacheResult {
     LoadError,
 }
 
-/// Geometry needed to decide whether a display-sized raster decode is close enough to a
-/// viewport to be active. These records are retained with the display list and re-evaluated
-/// whenever compositor scroll offsets change.
+/// Struct of geometry info that needed to decide whether an image is close enough to a viewport.
+/// These records are retained and used whenever scroll offset changes.
 #[derive(Clone, Debug)]
 pub(crate) struct RasterDecodeCandidate {
     pub id: PendingImageId,
