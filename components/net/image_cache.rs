@@ -1096,11 +1096,12 @@ impl ImageCacheStore {
                     id: msg.key,
                     metadata,
                     cors_status,
+                    load_time: pending.response_end,
                     bytes: pending
-                        .encoded_body
+                        .shared_body
                         .clone()
-                        .map(EncodedImageBytes::Cached)
-                        .unwrap_or_else(|| EncodedImageBytes::Owned(bytes.clone())),
+                        .map(EncodedImageBytes::NetResponseBody)
+                        .unwrap_or_else(|| EncodedImageBytes::ImageBufferFallback(bytes.clone())),
                 }))
             },
             Some(DecodedImage::Raster(raster_image)) => {
