@@ -887,8 +887,7 @@ impl LayoutThread {
 
                 let Some(mut visible_rect) = transform_rect(candidate.bounds, candidate.spatial_id)
                 else {
-                    // Projection failures are treated conservatively so that unusual transforms
-                    // cannot cause a visible image to be evicted.
+                    // Weirdly projected images are kept, just in case.
                     return true;
                 };
 
