@@ -206,7 +206,8 @@ pub struct LayoutThread {
     /// The [`StackingContextTree`] cached from previous layouts.
     stacking_context_tree: RefCell<Option<StackingContextTree>>,
 
-    /// Encoded raster uses retained with the current display list for viewport-demand updates.
+    /// Updated whenever new display list is built. Scrolling does not update the list.
+    /// Has to be re-populated whenever there is new display list, on reflow.
     raster_decode_candidates: RefCell<Vec<RasterDecodeCandidate>>,
 
     // A cache that maps image resources specified in CSS (e.g as the `url()` value

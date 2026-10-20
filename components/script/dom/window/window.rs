@@ -810,10 +810,10 @@ impl Window {
     pub(crate) fn handle_encoded_raster_image_ready(
         &self,
         id: PendingImageId,
-        current_counter: RasterDecodeRequestCounter,
+        decode_target_version: RasterDecodeRequestCounter,
     ) {
         let mut pending = self.pending_encoded_raster_images.borrow_mut();
-        if pending.get(&id) == Some(&current_counter) {
+        if pending.get(&id) == Some(&decode_target_version) {
             pending.remove(&id);
         }
         self.layout().set_needs_new_display_list();

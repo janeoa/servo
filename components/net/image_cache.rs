@@ -530,13 +530,12 @@ struct DemandDrivenRasterEntry {
     encoded_image_source: Arc<EncodedImage>,
     current_decoded_scaled_image: Option<RasterImage>,
     target_image_metadata: Option<ImageMetadata>,
-    current_counter: RasterDecodeRequestCounter,
+    decode_target_version: RasterDecodeRequestCounter,
     completed: Option<RasterDecodeRequestCounter>,
     pending: Option<RasterDecodeRequestCounter>,
     decoding: bool,
     failed_target: Option<ImageMetadata>,
-    /// The last complete viewport-demand update in which this image was active.
-    last_active_epoch: u64,
+    lru_last_active_epoch: u64,
 }
 
 fn select_inactive_raster_evictions(
@@ -692,7 +691,7 @@ impl ImageCacheStore {
                 Some((
                     id,
                     entry.target_image_metadata.is_some(),
-                    entry.last_active_epoch,
+                    entry.lru_last_active_epoch,
                     image.bytes.len() as u64,
                 ))
             })
@@ -717,7 +716,7 @@ impl ImageCacheStore {
             evicted_bytes += image_bytes;
             debug!(
                 "Evicting demand-decoded raster {id:?}: resolution {:?}, {} bytes, last active epoch {}",
-                image.decoded_resolution, image_bytes, entry.last_active_epoch
+                image.decoded_resolution, image_bytes, entry.lru_last_active_epoch
             );
         }
 
@@ -749,7 +748,7 @@ impl ImageCacheStore {
             .retain(|pending| match pending {
                 PendingKey::DemandDecodedRaster((id, generation, _)) => {
                     entries.get(id).is_some_and(|entry| {
-                        entry.current_counter == *generation &&
+                        entry.decode_target_version == *generation &&
                             entry.target_image_metadata.is_some()
                     })
                 },
@@ -764,7 +763,9 @@ impl ImageCacheStore {
                 let Some(entry) = self.encoded_raster_images.get_mut(&id) else {
                     return;
                 };
-                if entry.current_counter != generation || entry.target_image_metadata.is_none() {
+                if entry.decode_target_version != generation ||
+                    entry.target_image_metadata.is_none()
+                {
                     return;
                 }
                 if let Some(key) = entry
@@ -951,12 +952,12 @@ impl ImageCacheStore {
                         encoded_image_source: source.clone(),
                         current_decoded_scaled_image: None,
                         target_image_metadata: None,
-                        current_counter: RasterDecodeRequestCounter::default(),
+                        decode_target_version: RasterDecodeRequestCounter::default(),
                         completed: None,
                         pending: None,
                         decoding: false,
                         failed_target: None,
-                        last_active_epoch: 0,
+                        lru_last_active_epoch: 0,
                     },
                 );
                 ImageResponse::Loaded(Image::Encoded(source), url.unwrap())
@@ -1426,22 +1427,22 @@ impl ImageCache for ImageCacheImpl {
             });
             if decode_state.target_image_metadata != target {
                 decode_state.target_image_metadata = target;
-                decode_state.current_counter.increment();
+                decode_state.decode_target_version.increment();
                 decode_state.pending = None;
             }
             if let Some(target) = target {
-                decode_state.last_active_epoch = usage_epoch;
+                decode_state.lru_last_active_epoch = usage_epoch;
                 if decode_state
                     .current_decoded_scaled_image
                     .as_ref()
                     .is_some_and(|image| image.decoded_resolution == target)
                 {
-                    decode_state.completed = Some(decode_state.current_counter);
+                    decode_state.completed = Some(decode_state.decode_target_version);
                 }
                 statuses.push(RasterDecodeDemandStatus {
                     id,
-                    counter: decode_state.current_counter,
-                    pending: decode_state.completed != Some(decode_state.current_counter) &&
+                    counter: decode_state.decode_target_version,
+                    pending: decode_state.completed != Some(decode_state.decode_target_version) &&
                         decode_state.failed_target != Some(target),
                 });
             }
@@ -1934,8 +1935,8 @@ fn start_demand_decode(
             return;
         };
         if decode_state.decoding ||
-            decode_state.pending == Some(decode_state.current_counter) ||
-            decode_state.completed == Some(decode_state.current_counter) ||
+            decode_state.pending == Some(decode_state.decode_target_version) ||
+            decode_state.completed == Some(decode_state.decode_target_version) ||
             decode_state.failed_target == Some(target)
         {
             return;
@@ -1946,14 +1947,14 @@ fn start_demand_decode(
             .as_ref()
             .is_some_and(|image| image.decoded_resolution == target)
         {
-            decode_state.completed = Some(decode_state.current_counter);
+            decode_state.completed = Some(decode_state.decode_target_version);
             return;
         }
         decode_state.decoding = true;
         (
             decode_state.encoded_image_source.clone(),
             target,
-            decode_state.current_counter,
+            decode_state.decode_target_version,
         )
     };
     debug!(
@@ -1983,7 +1984,7 @@ fn start_demand_decode(
                 return;
             };
             entry.decoding = false;
-            if entry.current_counter == generation {
+            if entry.decode_target_version == generation {
                 if let Some(image) = decoded {
                     entry.pending = Some(generation);
                     // Updates reuse the existing key and do not consume a new key.
