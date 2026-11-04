@@ -3177,10 +3177,11 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
             None => match force {
                 // Step 4.1.
                 None | Some(true) => {
+                    let value = self.parse_attribute(&ns!(), &name, DOMString::new());
                     self.set_first_matching_attribute(
                         cx,
                         name.clone(),
-                        AttrValue::String(String::new()),
+                        value,
                         name.clone(),
                         ns!(),
                         None,

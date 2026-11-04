@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>toggleAttribute handles typed attribute values</title>
+<link rel="help" href="https://dom.spec.whatwg.org/#dom-element-toggleattribute">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<body>
+<script>
+for (const force of [undefined, true]) {
+  test(t => {
+    const textarea = document.createElement("textarea");
+    textarea.textContent = "x";
+    document.body.append(textarea);
+    t.add_cleanup(() => textarea.remove());
+
+    for (let i = 0; i < 2; ++i) {
+      assert_true(textarea.toggleAttribute("maxlength", force));
+      assert_equals(textarea.getAttribute("maxlength"), "");
+      assert_equals(textarea.maxLength, -1);
+      assert_false(textarea.toggleAttribute("maxlength", false));
+    }
+  }, `toggleAttribute parses an empty textarea maxlength (force: ${force})`);
+
+  test(t => {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const reference = svg.cloneNode();
+    reference.setAttribute("width", "");
+    assert_true(svg.toggleAttribute("width", force));
+    document.body.append(svg, reference);
+    t.add_cleanup(() => {
+      svg.remove();
+      reference.remove();
+    });
+
+    for (let i = 0; i < 2; ++i) {
+      assert_equals(svg.getAttribute("width"), "");
+      assert_equals(svg.getBoundingClientRect().width, reference.getBoundingClientRect().width);
+      assert_false(svg.toggleAttribute("width", false));
+      assert_true(svg.toggleAttribute("width", force));
+    }
+  }, `toggleAttribute parses an empty SVG width (force: ${force})`);
+}
+</script>
